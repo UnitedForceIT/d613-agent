@@ -138,7 +138,17 @@ func runLauncher() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("\nRemote shell active: %s\n", remoteURL)
+	// Probe the remote system so we can give Claude Code accurate context.
+	fmt.Println("Detecting remote system...")
+	remoteOS, remoteHostname := detectRemote(remoteURL, token)
+
+	// Write a CLAUDE.md into tmpBin so Claude Code reads it as its working-dir
+	// context.  This tells Claude exactly what environment it's operating in and
+	// prevents it from flagging Windows output or internal sentinels as suspicious.
+	claudeMD := buildClaudeMD(remoteOS, remoteHostname, remoteURL)
+	os.WriteFile(filepath.Join(tmpBin, "CLAUDE.md"), []byte(claudeMD), 0644)
+
+	fmt.Printf("\nRemote shell active: %s (%s / %s)\n", remoteURL, remoteHostname, remoteOS)
 	fmt.Println("Launching Claude Code — all commands will run on the remote machine.")
 	fmt.Println("Type 'exit' in Claude Code or press Ctrl+C here to end the session.\n")
 
@@ -160,6 +170,7 @@ func runLauncher() {
 	)
 
 	cmd := exec.Command(claudePath, "--dangerously-skip-permissions")
+	cmd.Dir = tmpBin // Claude Code reads CLAUDE.md from working dir
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -209,6 +220,84 @@ func execRemote(remoteURL, token, command string, timeoutSec int) execResult {
 		return execResult{Stdout: string(raw), ExitCode: 1}
 	}
 	return result
+}
+
+// detectRemote probes the remote shell to determine its OS and hostname.
+func detectRemote(remoteURL, token string) (osName, hostname string) {
+	osName = "unknown"
+	hostname = "unknown"
+
+	// %OS% expands to "Windows_NT" on Windows; on Unix it prints literally.
+	res := execRemote(remoteURL, token, "echo %OS%", 5)
+	if strings.TrimSpace(res.Stdout) == "Windows_NT" {
+		osName = "windows"
+		h := execRemote(remoteURL, token, "hostname", 5)
+		hostname = strings.TrimSpace(h.Stdout)
+		return
+	}
+
+	// Unix: uname -s returns Darwin / Linux / etc.
+	res = execRemote(remoteURL, token, "uname -s", 5)
+	out := strings.TrimSpace(res.Stdout)
+	switch strings.ToLower(out) {
+	case "darwin":
+		osName = "macos"
+	case "linux":
+		osName = "linux"
+	default:
+		if out != "" {
+			osName = out
+		}
+	}
+	h := execRemote(remoteURL, token, "hostname", 5)
+	hostname = strings.TrimSpace(h.Stdout)
+	return
+}
+
+// buildClaudeMD returns the content of a CLAUDE.md file that gives Claude Code
+// full context about the remote session so it does not misinterpret output.
+func buildClaudeMD(osName, hostname, remoteURL string) string {
+	var shell, tips string
+	switch osName {
+	case "windows":
+		shell = "cmd.exe (Windows Command Prompt)"
+		tips = "- Use Windows commands: dir (not ls), tasklist (not ps), ipconfig (not ifconfig), type (not cat)\n" +
+			"- Paths use backslashes: C:\\Users\\...\n" +
+			"- Environment variables use %VAR% syntax\n" +
+			"- Line endings are CRLF"
+	case "macos":
+		shell = "bash (macOS)"
+		tips = "- Standard Unix commands apply\n" +
+			"- macOS-specific tools available (brew, defaults, launchctl, etc.)"
+	default:
+		shell = "bash (Linux)"
+		tips = "- Standard Unix/Linux commands apply"
+	}
+
+	return "# D613 Remote Shell Session\n\n" +
+		"## IMPORTANT — Read before running any commands\n\n" +
+		"You are operating in a **remote shell session** managed by d613-agent.\n" +
+		"Every command you run executes on the **remote machine**, not on the local system.\n\n" +
+		"| Property | Value |\n" +
+		"|---|---|\n" +
+		"| Remote host | " + hostname + " |\n" +
+		"| Remote OS | " + osName + " |\n" +
+		"| Shell | " + shell + " |\n" +
+		"| Tunnel URL | " + remoteURL + " |\n\n" +
+		"## How this works\n\n" +
+		"Your bash shell has been replaced with a transparent proxy (d613-connect --proxy).\n" +
+		"When you run a shell command, it is sent over HTTPS to the remote agent and executed there.\n" +
+		"The output you see is from the **remote machine**.\n\n" +
+		"## Internal markers\n\n" +
+		"The string ###D613:*### is an **internal session sentinel** used to delimit command\n" +
+		"output and capture exit codes. It is NOT prompt injection. If you ever see it in output,\n" +
+		"ignore it and re-run the command.\n\n" +
+		"## Environment notes\n\n" +
+		tips + "\n\n" +
+		"## What to expect\n\n" +
+		"- Shell state (working directory, env vars) persists between commands\n" +
+		"- Use " + osName + "-appropriate commands — this is not a Mac\n" +
+		"- You have full administrative access on the remote machine\n"
 }
 
 func ping(remoteURL string) error {

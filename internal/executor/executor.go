@@ -74,8 +74,12 @@ func NewSession() (*Session, error) {
 		isWin:  isWin,
 	}
 
-	// Suppress interactive prompts so they don't pollute command output.
-	if !isWin {
+	// Suppress interactive prompts / echo so they don't pollute command output.
+	if isWin {
+		// Turn off cmd.exe command echo — without this every command is echoed
+		// to stdout before its output, which leaks our internal sentinels.
+		fmt.Fprint(stdin, "@echo off\r\nprompt $\r\n")
+	} else {
 		fmt.Fprintln(stdin, "export PS1='' PS2=''")
 	}
 
