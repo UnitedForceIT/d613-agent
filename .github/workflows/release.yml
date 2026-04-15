@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+            suffix: darwin-arm64
+          - goos: darwin
+            goarch: amd64
+            suffix: darwin-amd64
+          - goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+          - goos: windows
+            goarch: amd64
+            suffix: windows-amd64
+            ext: .exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build agent
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -ldflags "-s -w -X main.version=${{ github.ref_name }}" \
+            -o dist/d613-agent-${{ matrix.suffix }}${{ matrix.ext }} \
+            ./cmd/agent/
+
+      - name: Build connect
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -ldflags "-s -w -X main.version=${{ github.ref_name }}" \
+            -o dist/d613-connect-${{ matrix.suffix }}${{ matrix.ext }} \
+            ./cmd/connect/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.suffix }}
+          path: dist/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body: |
+            ## D613 Labs Remote Agent ${{ github.ref_name }}
+
+            ### One-liner install on the remote machine
+
+            **macOS / Linux:**
+            ```bash
+            curl -fsSL https://github.com/UntiedForce/d613-agent/releases/latest/download/install.sh | bash
+            ```
+
+            **Windows (PowerShell — run as Administrator):**
+            ```powershell
+            iwr -useb https://github.com/UntiedForce/d613-agent/releases/latest/download/install.ps1 | iex
+            ```
+
+            Then on **your** machine:
+            ```bash
+            d613-connect "<URL>" "<TOKEN>"
+            ```
+
+      - name: Upload install scripts to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            install.sh
+            install.ps1
