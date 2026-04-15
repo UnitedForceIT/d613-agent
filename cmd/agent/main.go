@@ -1,20 +1,4 @@
 // d613-agent — remote shell agent for D613 Labs AI troubleshooting.
-//
-// Run this binary on any machine (Windows/Mac/Linux) that needs to be
-// accessed remotely.  It will:
-//
-//  1. Start a persistent shell session on this machine.
-//  2. Bind a local HTTP server on a random port.
-//  3. Download cloudflared (if not already cached) and open a Cloudflare
-//     Quick Tunnel — no account or configuration required.
-//  4. Print the public HTTPS URL and a one-time auth token.
-//
-// On your own machine, run:
-//
-//	d613-connect <URL> <TOKEN>
-//
-// which launches Claude Code with all shell commands transparently forwarded
-// to this machine.
 package main
 
 import (
@@ -25,9 +9,12 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 
+	"github.com/UnitedForceIT/d613-agent/internal/bore"
 	"github.com/UnitedForceIT/d613-agent/internal/server"
+	"github.com/UnitedForceIT/d613-agent/internal/sshsetup"
 	"github.com/UnitedForceIT/d613-agent/internal/tunnel"
 )
 
@@ -40,12 +27,32 @@ func genToken() string {
 }
 
 func main() {
-	log.SetFlags(0) // no timestamp prefix in log output
+	log.SetFlags(0)
 	fmt.Printf("D613 Labs Remote Agent  v%s\n", version)
 	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 	token := genToken()
 
+	// ── SSH + WinRM (Windows only) ────────────────────────────────────────
+	var sshSession *sshsetup.Session
+	var boreTunnel *bore.Tunnel
+	if runtime.GOOS == "windows" {
+		fmt.Println("Enabling SSH and PowerShell Remoting for this session...")
+		var err error
+		sshSession, err = sshsetup.Enable()
+		if err != nil {
+			fmt.Printf("  [warn] SSH/WinRM setup failed: %v (continuing without it)\n", err)
+		} else {
+			fmt.Println("  SSH and WinRM enabled.")
+			fmt.Println("  Opening SSH tunnel via bore...")
+			boreTunnel, err = bore.Start(sshSession.SSHPort())
+			if err != nil {
+				fmt.Printf("  [warn] SSH tunnel failed: %v (SSH only reachable on LAN)\n", err)
+			}
+		}
+	}
+
+	// ── HTTP exec server ──────────────────────────────────────────────────
 	fmt.Println("Starting shell session...")
 	srv, err := server.New(token)
 	if err != nil {
@@ -55,14 +62,14 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Run HTTP server in background.
 	go func() {
 		if err := srv.Start(ctx); err != nil && ctx.Err() == nil {
 			log.Printf("server error: %v", err)
 		}
 	}()
 
-	fmt.Println("Opening Cloudflare tunnel (no account required)...")
+	// ── Cloudflare HTTP tunnel ────────────────────────────────────────────
+	fmt.Println("Opening Cloudflare tunnel...")
 	t, err := tunnel.Start(srv.Port)
 	if err != nil {
 		log.Fatalf("ERROR: tunnel failed: %v", err)
@@ -74,25 +81,47 @@ func main() {
 	fmt.Println("┌─────────────────────────────────────────────────────────────┐")
 	fmt.Println("│                     SESSION READY                           │")
 	fmt.Println("├─────────────────────────────────────────────────────────────┤")
-	fmt.Printf( "│  URL:   %-53s│\n", t.URL)
-	fmt.Printf( "│  Token: %-53s│\n", token)
+	fmt.Printf( "│  HTTP URL: %-50s│\n", t.URL)
+	fmt.Printf( "│  Token:    %-50s│\n", token)
 	fmt.Println("├─────────────────────────────────────────────────────────────┤")
-	fmt.Println("│  Run this on YOUR machine:                                  │")
-	fmt.Println("│                                                             │")
+	fmt.Println("│  Connect from your Mac (Claude Code proxy):                 │")
 	fmt.Printf( "│  d613-connect \"%s\"\n", t.URL)
 	fmt.Printf( "│               \"%s\"\n", token)
-	fmt.Println("│                                                             │")
-	fmt.Println("│  — or use the one-liner install on your machine:            │")
-	fmt.Println("│    curl -fsSL <connect-install-url> | bash                  │")
+
+	if sshSession != nil {
+		fmt.Println("├─────────────────────────────────────────────────────────────┤")
+		fmt.Println("│  SSH access (direct shell, for this session only):          │")
+		if boreTunnel != nil {
+			fmt.Printf("│  Host:  %-53s│\n", fmt.Sprintf("%s:%d", boreTunnel.Host, boreTunnel.Port))
+			fmt.Printf("│  User:  %-53s│\n", sshSession.Username())
+			fmt.Printf("│  Key:   (printed at agent startup, saved to TEMP)           │")
+			fmt.Printf("\n│\n│  ssh -i \"%s\" -p %d %s@bore.pub\n",
+				sshSession.PrivateKeyPath(), boreTunnel.Port, sshSession.Username())
+		} else {
+			fmt.Printf("│  ssh %s@<this-machine-ip>  (LAN only — bore tunnel failed)  │\n",
+				sshSession.Username())
+		}
+		fmt.Println("├─────────────────────────────────────────────────────────────┤")
+		fmt.Println("│  PowerShell Remoting (WinRM) also enabled on this session.  │")
+		fmt.Printf( "│  Enter-PSSession -ComputerName <IP> -Credential %s\n",
+			sshSession.Username())
+	}
+
 	fmt.Println("└─────────────────────────────────────────────────────────────┘")
 	fmt.Println()
-	fmt.Println("Session is live.  Press Ctrl+C to end.")
+	fmt.Println("Session is live. Press Ctrl+C to end (SSH/WinRM will be disabled).")
 
 	// ── Wait for shutdown ─────────────────────────────────────────────────
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 
-	fmt.Println("\nShutting down session...")
+	fmt.Println("\nShutting down...")
 	cancel()
+	if boreTunnel != nil {
+		boreTunnel.Stop()
+	}
+	if sshSession != nil {
+		sshSession.Disable()
+	}
 }
