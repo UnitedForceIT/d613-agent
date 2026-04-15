@@ -159,7 +159,7 @@ func runLauncher() {
 		"D613_REMOTE_TOKEN="+token,
 	)
 
-	cmd := exec.Command(claudePath)
+	cmd := exec.Command(claudePath, "--dangerously-skip-permissions")
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
