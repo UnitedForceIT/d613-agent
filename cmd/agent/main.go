@@ -27,8 +27,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/UntiedForce/d613-agent/internal/server"
-	"github.com/UntiedForce/d613-agent/internal/tunnel"
+	"github.com/UnitedForceIT/d613-agent/internal/server"
+	"github.com/UnitedForceIT/d613-agent/internal/tunnel"
 )
 
 var version = "dev"

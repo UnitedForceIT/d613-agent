@@ -8,7 +8,7 @@
 # agent.  No account, no configuration, no installation required.
 set -euo pipefail
 
-REPO="UntiedForce/d613-agent"
+REPO="UnitedForceIT/d613-agent"
 BINARY="d613-agent"
 DEST="/tmp/${BINARY}"
 

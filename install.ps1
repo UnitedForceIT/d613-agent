@@ -8,7 +8,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$repo     = "UntiedForce/d613-agent"
+$repo     = "UnitedForceIT/d613-agent"
 $binary   = "d613-agent"
 $arch     = if ([System.Environment]::Is64BitOperatingSystem) { "amd64" } else { "386" }
 $filename = "$binary-windows-$arch.exe"

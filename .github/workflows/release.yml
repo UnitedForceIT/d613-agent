@@ -84,12 +84,12 @@ jobs:
 
             **macOS / Linux:**
             ```bash
-            curl -fsSL https://github.com/UntiedForce/d613-agent/releases/latest/download/install.sh | bash
+            curl -fsSL https://github.com/UnitedForceIT/d613-agent/releases/latest/download/install.sh | bash
             ```
 
             **Windows (PowerShell — run as Administrator):**
             ```powershell
-            iwr -useb https://github.com/UntiedForce/d613-agent/releases/latest/download/install.ps1 | iex
+            iwr -useb https://github.com/UnitedForceIT/d613-agent/releases/latest/download/install.ps1 | iex
             ```
 
             Then on **your** machine:

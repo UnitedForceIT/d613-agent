@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/UntiedForce/d613-agent/internal/executor"
+	"github.com/UnitedForceIT/d613-agent/internal/executor"
 )
 
 // Server owns the HTTP listener and the persistent shell session.
