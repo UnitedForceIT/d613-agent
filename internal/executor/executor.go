@@ -26,20 +26,46 @@ type Result struct {
 	DurationMs int64  `json:"duration_ms"`
 }
 
-// Session holds a long-lived shell process.  All Execute calls are serialised
-// through a mutex so that output from concurrent requests cannot interleave.
-type Session struct {
-	mu     sync.Mutex
+// proc holds a single live shell process and its I/O handles.
+type proc struct {
+	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	reader *bufio.Reader
-	cmd    *exec.Cmd
-	isWin  bool
+	pr     *os.File // read end of the combined stdout+stderr pipe
+}
+
+// kill terminates the shell process and closes the pipe.
+func (p *proc) kill() {
+	p.stdin.Close()
+	if p.cmd != nil && p.cmd.Process != nil {
+		p.cmd.Process.Kill()
+		p.cmd.Wait()
+	}
+	p.pr.Close()
+}
+
+// Session wraps a proc and serialises command execution through a mutex.
+// If a command times out, the underlying proc is replaced with a fresh one
+// so subsequent commands are never affected by a leaked reader goroutine.
+type Session struct {
+	mu    sync.Mutex
+	isWin bool
+	p     *proc
 }
 
 // NewSession starts the underlying shell and returns a ready Session.
 func NewSession() (*Session, error) {
 	isWin := runtime.GOOS == "windows"
+	p, err := startProc(isWin)
+	if err != nil {
+		return nil, err
+	}
+	return &Session{isWin: isWin, p: p}, nil
+}
 
+// startProc launches a new shell process, configures it, and drains its
+// startup noise so the first Execute call sees a clean pipe.
+func startProc(isWin bool) (*proc, error) {
 	var cmd *exec.Cmd
 	if isWin {
 		cmd = exec.Command("cmd.exe")
@@ -67,35 +93,49 @@ func NewSession() (*Session, error) {
 	}
 	pw.Close() // close write-end in parent so reads on pr eventually get EOF
 
-	s := &Session{
+	p := &proc{
+		cmd:    cmd,
 		stdin:  stdin,
 		reader: bufio.NewReaderSize(pr, 64*1024),
-		cmd:    cmd,
-		isWin:  isWin,
+		pr:     pr,
 	}
 
-	// Suppress interactive prompts / echo so they don't pollute command output.
+	// Configure the shell and drain startup noise so Execute sees a clean pipe.
 	if isWin {
-		// Turn off cmd.exe command echo — without this every command is echoed
-		// to stdout before its output, which leaks our internal sentinels.
-		fmt.Fprint(stdin, "@echo off\r\nprompt $\r\n")
+		// Turn off command echo and simplify the prompt.
+		// Then write a known drain sentinel and read until we see its output —
+		// this discards the Windows copyright banner and the echoed setup lines.
+		drainSentinel := "###D613DRAIN###"
+		fmt.Fprint(stdin, "@echo off\r\nprompt $\r\necho "+drainSentinel+"\r\n")
+		for {
+			line, err := p.reader.ReadString('\n')
+			if strings.Contains(line, drainSentinel) {
+				break
+			}
+			if err != nil {
+				break
+			}
+		}
 	} else {
+		// Suppress the bash prompt so it never appears in command output.
 		fmt.Fprintln(stdin, "export PS1='' PS2=''")
 	}
 
-	return s, nil
+	return p, nil
 }
 
-// marker returns a random hex string used to delimit command output.
+// marker returns a random 16-char hex string used as a per-command sentinel.
 func marker() string {
 	b := make([]byte, 8)
 	rand.Read(b)
 	return hex.EncodeToString(b)
 }
 
-// Execute runs command in the persistent shell and returns the combined
-// stdout/stderr, exit code, and wall-clock duration.  Execution is bounded
-// by timeoutSec (default 60 s).
+// Execute runs command in the persistent shell and returns combined
+// stdout/stderr, exit code, and wall-clock duration.
+//
+// If the command times out, the underlying shell process is replaced so that
+// the leaked reader goroutine cannot corrupt subsequent calls.
 func (s *Session) Execute(command string, timeoutSec int) Result {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -108,30 +148,32 @@ func (s *Session) Execute(command string, timeoutSec int) Result {
 	sentinel := "###D613:" + m + ":"
 	start := time.Now()
 
-	// Wrap the user command so we always print a sentinel containing the exit
-	// code regardless of whether the command succeeds or fails.
 	var script string
 	if s.isWin {
-		// cmd.exe: 2>&1 redirect, then echo sentinel on its own line.
-		script = command + " 2>&1\r\necho " + sentinel + "%ERRORLEVEL%###\r\n"
+		// Capture ERRORLEVEL in a variable immediately after the command so
+		// that cmd.exe does not expand it at parse-time of the echo line.
+		script = command + " 2>&1\r\n" +
+			"set D613_EC=%ERRORLEVEL%\r\n" +
+			"echo " + sentinel + "%D613_EC%###\r\n"
 	} else {
-		// bash: run in a subshell, merge stderr, then printf sentinel.
 		script = "{ " + command + "; } 2>&1\nprintf '\\n" + sentinel + "%d###\\n' $?\n"
 	}
-	fmt.Fprint(s.stdin, script)
+	fmt.Fprint(s.p.stdin, script)
 
 	type readResult struct {
 		out  string
 		code int
 	}
 	ch := make(chan readResult, 1)
+	// Capture the current proc so the goroutine always refers to the proc we
+	// just wrote to, even if s.p gets replaced by a reset.
+	currentProc := s.p
 
 	go func() {
 		var sb strings.Builder
 		for {
-			line, err := s.reader.ReadString('\n')
+			line, err := currentProc.reader.ReadString('\n')
 			if idx := strings.Index(line, sentinel); idx >= 0 {
-				// Sentinel found — parse exit code from trailing "###".
 				rest := line[idx+len(sentinel):]
 				rest = strings.TrimRight(rest, "#\r\n ")
 				code, _ := strconv.Atoi(rest)
@@ -140,7 +182,7 @@ func (s *Session) Execute(command string, timeoutSec int) Result {
 			}
 			sb.WriteString(line)
 			if err != nil {
-				// Pipe closed — shell likely exited.
+				// Pipe closed — shell likely exited or was killed.
 				ch <- readResult{strings.TrimRight(sb.String(), "\n"), 1}
 				return
 			}
@@ -154,9 +196,17 @@ func (s *Session) Execute(command string, timeoutSec int) Result {
 			ExitCode:   r.code,
 			DurationMs: time.Since(start).Milliseconds(),
 		}
+
 	case <-time.After(time.Duration(timeoutSec) * time.Second):
+		// Kill the current proc — this closes the pipe and unblocks the reader
+		// goroutine above (it will get an EOF error and exit cleanly).
+		currentProc.kill()
+		// Start a fresh shell for the next command.
+		if fresh, err := startProc(s.isWin); err == nil {
+			s.p = fresh
+		}
 		return Result{
-			Stdout:     fmt.Sprintf("[command timed out after %ds]", timeoutSec),
+			Stdout:     fmt.Sprintf("[command timed out after %ds — session reset]", timeoutSec),
 			ExitCode:   124,
 			DurationMs: time.Since(start).Milliseconds(),
 		}
@@ -165,9 +215,7 @@ func (s *Session) Execute(command string, timeoutSec int) Result {
 
 // Close terminates the underlying shell process.
 func (s *Session) Close() {
-	s.stdin.Close()
-	if s.cmd.Process != nil {
-		s.cmd.Process.Kill()
-	}
-	s.cmd.Wait()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.p.kill()
 }
