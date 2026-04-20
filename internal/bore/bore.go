@@ -48,30 +48,39 @@ func Start(localPort int) (*Tunnel, error) {
 
 	cmd := exec.Command(borePath, "local", fmt.Sprintf("%d", localPort), "--to", "bore.pub")
 
-	stderr, err := cmd.StderrPipe()
+	// bore may write to either stderr or stdout depending on version; merge them.
+	pr, pw, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
 	if err := cmd.Start(); err != nil {
+		pw.Close()
+		pr.Close()
 		return nil, fmt.Errorf("start bore: %w", err)
 	}
+	pw.Close()
 
-	// bore prints: "listening at bore.pub:PORT"
+	// bore prints: "listening at bore.pub:PORT" (or via tracing crate with prefix)
 	portRe := regexp.MustCompile(`bore\.pub:(\d+)`)
 	portCh := make(chan int, 1)
 
 	go func() {
-		scanner := bufio.NewScanner(stderr)
+		scanner := bufio.NewScanner(pr)
 		for scanner.Scan() {
 			line := scanner.Text()
 			if m := portRe.FindStringSubmatch(line); m != nil {
 				var port int
 				fmt.Sscanf(m[1], "%d", &port)
 				portCh <- port
+				// drain remaining output
 				for scanner.Scan() {}
 				return
 			}
 		}
+		pr.Close()
 		close(portCh)
 	}()
 
@@ -79,11 +88,13 @@ func Start(localPort int) (*Tunnel, error) {
 	case port, ok := <-portCh:
 		if !ok {
 			cmd.Process.Kill()
+			cmd.Wait()
 			return nil, fmt.Errorf("bore exited before providing a port")
 		}
 		return &Tunnel{Host: "bore.pub", Port: port, cmd: cmd}, nil
-	case <-time.After(20 * time.Second):
+	case <-time.After(30 * time.Second):
 		cmd.Process.Kill()
+		cmd.Wait()
 		return nil, fmt.Errorf("timed out waiting for bore tunnel")
 	}
 }

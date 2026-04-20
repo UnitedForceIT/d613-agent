@@ -13,6 +13,8 @@ import (
 	"syscall"
 
 	"github.com/UnitedForceIT/d613-agent/internal/bore"
+	"github.com/UnitedForceIT/d613-agent/internal/defender"
+	"github.com/UnitedForceIT/d613-agent/internal/prereqs"
 	"github.com/UnitedForceIT/d613-agent/internal/server"
 	"github.com/UnitedForceIT/d613-agent/internal/sshsetup"
 	"github.com/UnitedForceIT/d613-agent/internal/tunnel"
@@ -33,28 +35,49 @@ func main() {
 
 	token := genToken()
 
-	// ── SSH + WinRM (Windows only) ────────────────────────────────────────
+	// ── Windows Defender exclusion for our temp dir (best-effort) ─────────
+	// Without this, bore.exe gets quarantined as "potentially unwanted software".
+	if runtime.GOOS == "windows" {
+		defender.AddTempExclusion()
+	}
+
+	// ── Prerequisites (Node.js + Claude Code) ─────────────────────────────
+	fmt.Println("Checking prerequisites...")
+	prereqState, err := prereqs.Ensure()
+	if err != nil {
+		fmt.Printf("  [warn] Prerequisites check failed: %v\n", err)
+		fmt.Println("  Continuing — admin will need Claude Code installed separately.")
+	}
+
+	// ── SSH setup (Windows/macOS/Linux) ───────────────────────────────────
 	var sshSession *sshsetup.Session
 	var boreTunnel *bore.Tunnel
-	if runtime.GOOS == "windows" {
-		fmt.Println("Enabling SSH and PowerShell Remoting for this session...")
-		var err error
-		sshSession, err = sshsetup.Enable()
+	srvCfg := server.Config{}
+
+	fmt.Println("Enabling SSH for this session...")
+	sshSession, err = sshsetup.Enable()
+	if err != nil {
+		fmt.Printf("  [warn] SSH setup failed: %v (continuing without it)\n", err)
+		if u := os.Getenv("USER"); u != "" {
+			srvCfg.SSHUser = u
+		}
+	} else {
+		fmt.Println("  SSH enabled.")
+		srvCfg.SSHKeyPath = sshSession.PrivateKeyPath()
+		srvCfg.SSHUser = sshSession.Username()
+
+		fmt.Println("  Opening SSH tunnel via bore...")
+		boreTunnel, err = bore.Start(sshSession.SSHPort())
 		if err != nil {
-			fmt.Printf("  [warn] SSH/WinRM setup failed: %v (continuing without it)\n", err)
+			fmt.Printf("  [warn] SSH tunnel failed: %v (SSH only reachable on LAN)\n", err)
 		} else {
-			fmt.Println("  SSH and WinRM enabled.")
-			fmt.Println("  Opening SSH tunnel via bore...")
-			boreTunnel, err = bore.Start(sshSession.SSHPort())
-			if err != nil {
-				fmt.Printf("  [warn] SSH tunnel failed: %v (SSH only reachable on LAN)\n", err)
-			}
+			srvCfg.BorePath = fmt.Sprintf("%s:%d", boreTunnel.Host, boreTunnel.Port)
 		}
 	}
 
-	// ── HTTP exec server ──────────────────────────────────────────────────
-	fmt.Println("Starting shell session...")
-	srv, err := server.New(token)
+	// ── HTTP server ───────────────────────────────────────────────────────
+	fmt.Println("Starting agent...")
+	srv, err := server.New(token, srvCfg)
 	if err != nil {
 		log.Fatalf("ERROR: could not start server: %v", err)
 	}
@@ -81,35 +104,27 @@ func main() {
 	fmt.Println("┌─────────────────────────────────────────────────────────────┐")
 	fmt.Println("│                     SESSION READY                           │")
 	fmt.Println("├─────────────────────────────────────────────────────────────┤")
-	fmt.Printf( "│  HTTP URL: %-50s│\n", t.URL)
-	fmt.Printf( "│  Token:    %-50s│\n", token)
+	fmt.Printf( "│  URL:   %-52s│\n", t.URL)
+	fmt.Printf( "│  Token: %-52s│\n", token)
 	fmt.Println("├─────────────────────────────────────────────────────────────┤")
-	fmt.Println("│  Connect from your Mac (Claude Code proxy):                 │")
+	fmt.Println("│  Run this on your admin machine:                            │")
 	fmt.Printf( "│  d613-connect \"%s\"\n", t.URL)
 	fmt.Printf( "│               \"%s\"\n", token)
 
 	if sshSession != nil {
 		fmt.Println("├─────────────────────────────────────────────────────────────┤")
-		fmt.Println("│  SSH access (direct shell, for this session only):          │")
 		if boreTunnel != nil {
-			fmt.Printf("│  Host:  %-53s│\n", fmt.Sprintf("%s:%d", boreTunnel.Host, boreTunnel.Port))
-			fmt.Printf("│  User:  %-53s│\n", sshSession.Username())
-			fmt.Printf("│  Key:   (printed at agent startup, saved to TEMP)           │")
-			fmt.Printf("\n│\n│  ssh -i \"%s\" -p %d %s@bore.pub\n",
-				sshSession.PrivateKeyPath(), boreTunnel.Port, sshSession.Username())
+			fmt.Printf("│  SSH (via bore): ssh -p %d %s@bore.pub\n",
+				boreTunnel.Port, sshSession.Username())
 		} else {
-			fmt.Printf("│  ssh %s@<this-machine-ip>  (LAN only — bore tunnel failed)  │\n",
+			fmt.Printf("│  SSH (LAN only): ssh %s@<this-machine-ip>\n",
 				sshSession.Username())
 		}
-		fmt.Println("├─────────────────────────────────────────────────────────────┤")
-		fmt.Println("│  PowerShell Remoting (WinRM) also enabled on this session.  │")
-		fmt.Printf( "│  Enter-PSSession -ComputerName <IP> -Credential %s\n",
-			sshSession.Username())
 	}
 
 	fmt.Println("└─────────────────────────────────────────────────────────────┘")
 	fmt.Println()
-	fmt.Println("Session is live. Press Ctrl+C to end (SSH/WinRM will be disabled).")
+	fmt.Println("Waiting for admin connection. Press Ctrl+C to end session.")
 
 	// ── Wait for shutdown ─────────────────────────────────────────────────
 	sig := make(chan os.Signal, 1)
@@ -122,6 +137,11 @@ func main() {
 		boreTunnel.Stop()
 	}
 	if sshSession != nil {
+		fmt.Println("  Disabling SSH and WinRM...")
 		sshSession.Disable()
 	}
+	if prereqState != nil {
+		prereqState.Cleanup()
+	}
+	fmt.Println("Session ended. All temporary access disabled.")
 }
